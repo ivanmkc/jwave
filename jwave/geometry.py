@@ -454,7 +454,7 @@ class Sources:
 
 @register_pytree_node_class
 class DistributedTransducer:
-    def __init__(self, mask, signal=jnp.array([]), domain=None):
+    def __init__(self, mask, signal=jnp.array([]), domain=None, is_active=True):
         """
         Initialize the DistributedTransducer.
 
@@ -466,6 +466,7 @@ class DistributedTransducer:
         self.mask = mask
         self.signal = signal
         self.domain = domain if domain is not None else mask.domain
+        self.is_active = is_active
 
     def tree_flatten(self):
         """
@@ -498,6 +499,19 @@ class DistributedTransducer:
         """
         return dot_product(self.mask, p)
 
+    
+    def set_is_active(self, is_active):
+        """
+        Set the is_active state for the transducer element.
+
+        Args:
+            is_active: The state to be set for the element.
+
+        Returns:
+            A new instance of DistributedTransducer with the updated is_active state.
+        """
+        return DistributedTransducer(self.mask, self.signal, self.domain, is_active)
+
     def set_signal(self, signal):
         """
         Set the signal for the transducer element.
@@ -508,7 +522,7 @@ class DistributedTransducer:
         Returns:
             A new instance of DistributedTransducer with the updated signal.
         """
-        return DistributedTransducer(self.mask, signal, self.domain)
+        return DistributedTransducer(self.mask, signal, self.domain, self.is_active)
 
     def on_grid(self, n):
         """
@@ -520,7 +534,9 @@ class DistributedTransducer:
         Returns:
             The wavefield produced by the transducer element.
         """
-        src = jnp.zeros(self.domain.N)
+        
+        if not self.is_active:
+            return jnp.expand_dims(jnp.zeros(self.domain.N), -1)
     
         idx = n.astype(jnp.int32)
         signal = self.signal[:, idx]
@@ -568,6 +584,23 @@ class TransducerArray:
             raise NotImplemented("A finite radius is not currently supported")
 
         self.elements = self._create_elements(signal)
+
+    def set_active_elements(self, active_elements: Union[List[Union[bool, int]], np.ndarray]) -> None:
+        """
+        Set the active/inactive status of the transducer elements.
+
+        Args:
+            active_elements: A boolean or integer array or list indicating the active/inactive status of each element.
+                             True or 1 for active, False or 0 for inactive.
+        """
+        assert len(active_elements) == self.num_elements, "The length of active_elements must match the total number of elements."
+
+        for i, active in enumerate(active_elements):
+            if isinstance(active, int):
+                assert active in [0, 1], "Integer values for active_elements must be either 0 or 1."
+                self.elements[i] = self.elements[i].set_is_active(bool(active))
+            else:
+                self.elements[i] = self.elements[i].set_is_active(active)
 
     def _create_elements(self, signal=None) -> List[DistributedTransducer]:
         """
@@ -657,8 +690,8 @@ class TransducerArray:
         Args:
             signal: The signal to be set for all elements.
         """
-        for element in self.elements:
-            element.set_signal(signal)
+        for idx, element in enumerate(self.elements):
+            self.elements[idx] = element.set_signal(signal)
 
     def on_grid(self, n):
         """
