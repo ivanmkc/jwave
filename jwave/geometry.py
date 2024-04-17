@@ -527,25 +527,173 @@ class DistributedTransducer:
                 
         return signal * self.mask.on_grid
 
+@register_pytree_node_class
+class TransducerArray:
+    def __init__(
+        self,
+        domain: Domain,
+        num_elements: int,
+        element_width: int,
+        element_height: int = 1,
+        element_depth: int = 1,
+        element_spacing: int = 0,
+        position: Tuple[int] = (1,),
+        radius: float = float("inf"),
+        signal: jnp.ndarray = None,
+    ):
+        """
+        Initialize the TransducerArray.
 
-def get_line_transducer(domain,
-                        position,
-                        width,
-                        angle=0) -> DistributedTransducer:
-    r"""
-    Construct a line transducer (2D)
-    """
-    if angle != 0:
-        raise NotImplementedError("Angle not implemented yet")
+        Args:
+            domain: The computational domain.
+            num_elements: The number of transducer elements.
+            element_width: The width of each element in grid points. In the x direction.
+            element_height: The length of each element in grid points (default: 1). In the y direction
+            element_depth: The height of each element in grid points (default: 1). In the z direction.
+            element_spacing: The spacing between elements in grid points (default: 0). In the x direction.
+            position: The position of the corner of the transducer array in the grid (default: (1,)).
+            radius: The radius of curvature of the transducer array (default: inf).
+            signal: The signal to be set for all elements (default: None).
+        """
+        self.domain = domain
+        self.num_elements = num_elements
+        self.element_width = element_width
+        self.element_height = element_height
+        self.element_depth = element_depth
+        self.element_spacing = element_spacing
+        self.position = position
+        self.radius = radius
+        
+        if not np.isinf(self.radius):
+            raise NotImplemented("A finite radius is not currently supported")
 
-    # Generate mask
-    mask = jnp.zeros(domain.N)
-    start_col = (domain.N[1] - width) // 2
-    end_col = (domain.N[1] + width) // 2
-    mask = mask.at[position, start_col:end_col].set(1.0)
-    mask = jnp.expand_dims(mask, -1)
-    mask = FourierSeries(mask, domain)
-    return DistributedTransducer(mask, [], 0.0, domain)
+        self.elements = self._create_elements(signal)
+
+    def _create_elements(self, signal=None) -> List[DistributedTransducer]:
+        """
+        Create instances of DistributedTransducer for each element.
+
+        Args:
+            signal: The signal to be set for all elements (default: None).
+
+        Returns:
+            A list of DistributedTransducer instances representing each element.
+        """
+        elements = []
+        for element_index in range(self.num_elements):
+            # Calculate the position of the current element based on the domain dimensions
+            element_pos = list(self.position)
+            element_pos[0] += (self.element_width + self.element_spacing) * element_index
+
+            # Create a mask for the current element
+            mask = jnp.zeros(self.domain.N)
+
+            # Set the mask values to 1.0 for the current element based on the domain dimensions
+            if self.domain.ndim == 1:
+                mask = mask.at[slice(element_pos[0], element_pos[0] + self.element_width)].set(1.0)
+            elif self.domain.ndim == 2:
+                mask = mask.at[
+                    slice(element_pos[0], element_pos[0] + self.element_width),
+                    slice(element_pos[1], element_pos[1] + self.element_height)
+                ].set(1.0)
+            elif self.domain.ndim == 3:
+                mask = mask.at[
+                    slice(element_pos[0], element_pos[0] + self.element_width),
+                    slice(element_pos[1], element_pos[1] + self.element_height),
+                    slice(element_pos[2], element_pos[2] + self.element_depth)
+                ].set(1.0)
+
+            # Add an extra dimension to the mask and convert it to a FourierSeries
+            mask = jnp.expand_dims(mask, -1)
+            mask = FourierSeries(mask, self.domain)
+
+            # Create a DistributedTransducer instance for the current element
+            element = DistributedTransducer(mask, signal, self.domain)
+            elements.append(element)
+
+        return elements
+
+    def tree_flatten(self):
+        """
+        Flatten the TransducerArray for PyTree compatibility.
+        """
+        children = (self.elements,)
+        aux = (self.domain, self.num_elements, self.element_width, self.element_height, self.element_depth, self.element_spacing, self.position, self.radius)
+        return (children, aux)
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        """
+        Unflatten the TransducerArray for PyTree compatibility.
+        """
+        elements = children[0]
+        domain, num_elements, element_width, element_height, element_depth, element_spacing, position, radius = aux
+        transducer_array = cls(domain, num_elements, element_width, element_height, element_depth, element_spacing, position, radius)
+        transducer_array.elements = elements
+        return transducer_array
+
+    def __call__(self, p: Field, u: Field, rho: Field):
+        """
+        Compute the output for each transducer element.
+
+        Args:
+            p: The pressure field.
+            u: The velocity field (not used in this implementation).
+            rho: The density field (not used in this implementation).
+
+        Returns:
+            An array of outputs for each transducer element.
+        """
+        element_outputs = []
+        for element in self.elements:
+            element_output = element(p, u, rho)
+            element_outputs.append(element_output)
+        return jnp.array(element_outputs)
+
+    def set_signal(self, signal):
+        """
+        Set the same signal for all transducer elements.
+
+        Args:
+            signal: The signal to be set for all elements.
+        """
+        for element in self.elements:
+            element.set_signal(signal)
+
+    def on_grid(self, n):
+        """
+        Compute the wavefield produced by the transducer array on the grid.
+
+        Args:
+            n: The time index for the signals.
+
+        Returns:
+            The wavefield produced by the transducer array.
+        """
+        wavefield = jnp.expand_dims(jnp.zeros(self.domain.N), -1)
+        
+        for element in self.elements:
+            wavefield += element.on_grid(n)
+        
+        return wavefield     
+    
+    def get_segmentation_mask(self) -> np.array:
+        """
+        Generates a segmentation mask of the transducer elements on the grid.
+
+        Returns:
+            An array where each transducer's footprint is marked with its index+1 and non-transducer areas are 0.
+        """
+        # Create an empty mask with the same shape as the domain
+        segmentation_mask = np.zeros(self.domain.N)
+
+        # Iterate over each element and set its index in the segmentation mask
+        for idx, element in enumerate(self.elements):
+            mask = element.mask.on_grid  # Assuming the mask is stored in a JAX array within each DistributedTransducer
+            indices = jnp.where(mask == 1)[:-1]
+            segmentation_mask[indices] = idx + 1
+
+        return segmentation_mask
 
 
 @dataclass
