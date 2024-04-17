@@ -454,50 +454,78 @@ class Sources:
 
 @register_pytree_node_class
 class DistributedTransducer:
-    mask: Field
-    signal: jnp.ndarray
-    dt: float
-    domain: Domain
+    def __init__(self, mask, signal=jnp.array([]), domain=None):
+        """
+        Initialize the DistributedTransducer.
 
-    def __init__(self, mask, signal, dt, domain):
+        Args:
+            mask: The mask representing the transducer element.
+            signal: The signal for the transducer element (default: empty array).
+            domain: The computational domain (default: None).
+        """
         self.mask = mask
         self.signal = signal
-        self.dt = dt
-        self.domain = domain
+        self.domain = domain if domain is not None else mask.domain
 
     def tree_flatten(self):
-        children = (self.mask, self.signal, self.dt)
-        aux = (self.domain, )
+        """
+        Flatten the DistributedTransducer for PyTree compatibility.
+        """
+        children = (self.mask, self.signal)
+        aux = (self.domain,)
         return (children, aux)
 
     @classmethod
     def tree_unflatten(cls, aux, children):
-        mask, signal, dt = children
+        """
+        Unflatten the DistributedTransducer for PyTree compatibility.
+        """
+        mask, signal = children
         domain = aux[0]
-        a = cls(mask, signal, dt, domain)
-        return a
+        return cls(mask, signal, domain)
 
-    def __call__(self, u: Field):
-        # returns the transducer output for the wavefield u
-        # (Receive mode)
-        return dot_product(self.mask, u)
+    def __call__(self, p: Field, u: Field, rho: Field):
+        """
+        Compute the output for the transducer element.
 
-    def set_signal(self, s):
-        return DistributedTransducer(self.mask, s, self.dt, self.domain)
+        Args:
+            p: The pressure field.
+            u: The velocity field (not used in this implementation).
+            rho: The density field (not used in this implementation).
 
-    def set_mask(self, m):
-        return DistributedTransducer(m, self.signal, self.dt, m.domain)
+        Returns:
+            The output of the transducer element.
+        """
+        return dot_product(self.mask, p)
+
+    def set_signal(self, signal):
+        """
+        Set the signal for the transducer element.
+
+        Args:
+            signal: The signal to be set for the element.
+
+        Returns:
+            A new instance of DistributedTransducer with the updated signal.
+        """
+        return DistributedTransducer(self.mask, signal, self.domain)
 
     def on_grid(self, n):
-        # Returns the wavefield produced by the transducer on the grid
-        # (Transmit mode)
+        """
+        Compute the wavefield produced by the transducer element on the grid.
 
-        if len(self.signal) == 0:
-            return 0.0
+        Args:
+            n: The time index for the signal.
 
+        Returns:
+            The wavefield produced by the transducer element.
+        """
+        src = jnp.zeros(self.domain.N)
+    
         idx = n.astype(jnp.int32)
-        signal = self.signal[idx]
-        return signal * self.mask
+        signal = self.signal[:, idx]
+                
+        return signal * self.mask.on_grid
 
 
 def get_line_transducer(domain,
