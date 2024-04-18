@@ -15,7 +15,7 @@
 
 import math
 from dataclasses import dataclass
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import equinox as eqx
 import numpy as np
@@ -555,7 +555,11 @@ class TransducerArray:
         element_spacing: int = 0,
         position: Tuple[int] = (1,),
         radius: float = float("inf"),
+        sound_speed: Optional[float] = None,
+        focus_distance: float = float("inf"),
+        steering_angle: float = 0.0,
         signal: jnp.ndarray = None,
+        dt: float = None,
     ):
         """
         Initialize the TransducerArray.
@@ -564,12 +568,16 @@ class TransducerArray:
             domain: The computational domain.
             num_elements: The number of transducer elements.
             element_width: The width of each element in grid points. In the x direction.
-            element_height: The length of each element in grid points (default: 1). In the y direction
+            element_height: The length of each element in grid points (default: 1). In the y direction.
             element_depth: The height of each element in grid points (default: 1). In the z direction.
             element_spacing: The spacing between elements in grid points (default: 0). In the x direction.
-            position: The position of the corner of the transducer array in the grid (default: (1,)).
-            radius: The radius of curvature of the transducer array (default: inf).
+            position: The position of the corner of the transducer array in grid points (default: (1,)).
+            radius: The radius of curvature of the transducer array in meters (default: inf).
+            sound_speed: The assumed homogeneous sound speed in meters per second for beamforming purposes (default: None).
+            focus_distance: The focus distance in meters for beamforming (default: inf).
+            steering_angle: The steering angle in degrees for beamforming (default: 0.0).
             signal: The signal to be set for all elements (default: None).
+            dt: The time step of the simulation in seconds (default: None).
         """
         self.domain = domain
         self.num_elements = num_elements
@@ -577,34 +585,51 @@ class TransducerArray:
         self.element_height = element_height
         self.element_depth = element_depth
         self.element_spacing = element_spacing
+
+        assert len(position) == self.domain.ndim, f"Position dimensionality {len(position)} must match domain dimensionality {self.domain.ndim}"
         self.position = position
+
         self.radius = radius
-        
+
         if not np.isinf(self.radius):
-            raise NotImplemented("A finite radius is not currently supported")
+            raise NotImplementedError("A finite radius is not currently supported")
+
+        assert sound_speed is not None, "sound_speed must be provided"
+        assert dt is not None, "dt must be provided"
+
+        self.sound_speed = sound_speed
+        self.focus_distance = focus_distance
+        self.steering_angle = steering_angle
+        self.dt = dt
 
         self.elements = self._create_elements(signal)
-
-    def set_active_elements(self, active_elements: Union[List[Union[bool, int]], np.ndarray]) -> None:
+    
+    def tree_flatten(self):
         """
-        Set the active/inactive status of the transducer elements.
-
-        Args:
-            active_elements: A boolean or integer array or list indicating the active/inactive status of each element.
-                             True or 1 for active, False or 0 for inactive.
+        Flatten the TransducerArray for PyTree compatibility.
         """
-        assert len(active_elements) == self.num_elements, "The length of active_elements must match the total number of elements."
+        children = (self.elements,)
+        aux = (self.domain, self.num_elements, self.element_width, self.element_height,
+               self.element_depth, self.element_spacing, self.position,
+               self.radius, self.sound_speed, self.focus_distance, self.steering_angle, self.dt)
+        return (children, aux)
 
-        for i, active in enumerate(active_elements):
-            if isinstance(active, int):
-                assert active in [0, 1], "Integer values for active_elements must be either 0 or 1."
-                self.elements[i] = self.elements[i].set_is_active(bool(active))
-            else:
-                self.elements[i] = self.elements[i].set_is_active(active)
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        """
+        Unflatten the TransducerArray for PyTree compatibility.
+        """
+        elements = children[0]
+        domain, num_elements, element_width, element_height, element_depth, element_spacing, position, radius, sound_speed, focus_distance, steering_angle, dt = aux
+        transducer_array = cls(domain, num_elements, element_width, element_height, element_depth,
+                               element_spacing, position, radius, sound_speed, focus_distance,
+                               steering_angle, None, dt)
+        transducer_array.elements = elements
+        return transducer_array
 
     def _create_elements(self, signal=None) -> List[DistributedTransducer]:
         """
-        Create instances of DistributedTransducer for each element.
+        Create instances of DistributedTransducer for each element and apply beamforming delays.
 
         Args:
             signal: The signal to be set for all elements (default: None).
@@ -613,6 +638,8 @@ class TransducerArray:
             A list of DistributedTransducer instances representing each element.
         """
         elements = []
+        delays = self._calculate_beamforming_delays()
+
         for element_index in range(self.num_elements):
             # Calculate the position of the current element based on the domain dimensions
             element_pos = list(self.position)
@@ -640,30 +667,91 @@ class TransducerArray:
             mask = jnp.expand_dims(mask, -1)
             mask = FourierSeries(mask, self.domain)
 
+            # Apply beamforming delay to the signal
+            delay = delays[element_index]
+            delay_samples = int(delay / self.dt)
+            delayed_signal = jnp.roll(signal, delay_samples) if signal is not None else None
+
             # Create a DistributedTransducer instance for the current element
-            element = DistributedTransducer(mask, signal, self.domain)
+            element = DistributedTransducer(mask, delayed_signal, self.domain)
             elements.append(element)
 
         return elements
 
-    def tree_flatten(self):
+    def _calculate_beamforming_delays(self):
         """
-        Flatten the TransducerArray for PyTree compatibility.
+        Calculate the beamforming delays in seconds for each element based on the focus distance and steering angle.
         """
-        children = (self.elements,)
-        aux = (self.domain, self.num_elements, self.element_width, self.element_height, self.element_depth, self.element_spacing, self.position, self.radius)
-        return (children, aux)
+        element_pitch = (self.element_width + self.element_spacing) * self.domain.dx[0]  # element pitch in meters (dx in the x dimension)
+        element_positions = jnp.arange(self.num_elements) - (self.num_elements - 1) / 2
+        element_positions = element_positions * element_pitch  # element positions in meters
 
-    @classmethod
-    def tree_unflatten(cls, aux, children):
+        if jnp.isinf(self.focus_distance):
+            delays = element_positions * jnp.sin(jnp.deg2rad(self.steering_angle)) / self.sound_speed  # delays in seconds
+        else:
+            delays = (
+                self.focus_distance
+                - jnp.sqrt(
+                    self.focus_distance ** 2
+                    + element_positions ** 2
+                    - 2 * self.focus_distance * element_positions * jnp.sin(jnp.deg2rad(self.steering_angle))
+                )
+            ) / self.sound_speed  # delays in seconds
+
+        return delays
+
+    def scan_line(self, sensor_data):
         """
-        Unflatten the TransducerArray for PyTree compatibility.
+        Apply beamforming to the sensor data to form a single scan line.
+
+        Args:
+            sensor_data: A 2D array of shape (time_samples, num_elements) containing the sensor data.
+
+        Returns:
+            A 1D array representing the formed scan line.
         """
-        elements = children[0]
-        domain, num_elements, element_width, element_height, element_depth, element_spacing, position, radius = aux
-        transducer_array = cls(domain, num_elements, element_width, element_height, element_depth, element_spacing, position, radius)
-        transducer_array.elements = elements
-        return transducer_array
+        time_samples, num_elements = sensor_data.shape
+
+        # Calculate the beamforming delays in samples
+        delays_samples = jnp.round(self._calculate_beamforming_delays() / self.dt).astype(int)
+
+        # Create an array to store the beamformed data
+        beamformed_data = jnp.zeros(time_samples)
+
+        # Apply beamforming delays to each element
+        for i in range(num_elements):
+            delay_samples = delays_samples[i]
+            if delay_samples > 0:
+                # Ensure the delay does not exceed the array bounds
+                valid_delay = min(delay_samples, time_samples)
+                beamformed_data += jnp.pad(sensor_data[:time_samples-valid_delay, i], (valid_delay, 0), 'constant')
+            elif delay_samples < 0:
+                # Correct handling for negative delays
+                valid_delay = min(-delay_samples, time_samples)
+                beamformed_data += jnp.pad(sensor_data[valid_delay:, i], (0, valid_delay), 'constant')
+            else:
+                # No delay
+                beamformed_data += sensor_data[:, i]
+
+        return beamformed_data
+
+
+    def set_active_elements(self, active_elements: Union[List[Union[bool, int]], np.ndarray]) -> None:
+        """
+        Set the active/inactive status of the transducer elements.
+
+        Args:
+            active_elements: A boolean or integer array or list indicating the active/inactive status of each element.
+                             True or 1 for active, False or 0 for inactive.
+        """
+        assert len(active_elements) == self.num_elements, "The length of active_elements must match the total number of elements."
+
+        for i, active in enumerate(active_elements):
+            if isinstance(active, int):
+                assert active in [0, 1], "Integer values for active_elements must be either 0 or 1."
+                self.elements[i] = self.elements[i].set_is_active(bool(active))
+            else:
+                self.elements[i] = self.elements[i].set_is_active(active)
 
     def __call__(self, p: Field, u: Field, rho: Field):
         """
@@ -727,7 +815,6 @@ class TransducerArray:
             segmentation_mask[indices] = idx + 1
 
         return segmentation_mask
-
 
 @dataclass
 class TimeHarmonicSource:
