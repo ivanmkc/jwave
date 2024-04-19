@@ -454,7 +454,7 @@ class Sources:
 
 @register_pytree_node_class
 class DistributedTransducer:
-    def __init__(self, mask, signal=jnp.array([]), domain=None, is_active=True):
+    def __init__(self, mask, signal=jnp.array([]), domain=None, is_active=True, center_pos=None):
         """
         Initialize the DistributedTransducer.
 
@@ -462,18 +462,21 @@ class DistributedTransducer:
             mask: The mask representing the transducer element.
             signal: The signal for the transducer element (default: empty array).
             domain: The computational domain (default: None).
+            is_active: The active state of the transducer element (default: True).
+            center_pos: The center position of the transducer element (default: None).
         """
         self.mask = mask
         self.signal = signal
         self.domain = domain if domain is not None else mask.domain
         self.is_active = is_active
+        self.center_pos = center_pos
 
     def tree_flatten(self):
         """
         Flatten the DistributedTransducer for PyTree compatibility.
         """
         children = (self.mask, self.signal)
-        aux = (self.domain,)
+        aux = (self.domain, self.is_active, self.center_pos)
         return (children, aux)
 
     @classmethod
@@ -482,8 +485,9 @@ class DistributedTransducer:
         Unflatten the DistributedTransducer for PyTree compatibility.
         """
         mask, signal = children
-        domain = aux[0]
-        return cls(mask, signal, domain)
+        domain, is_active, center_pos = aux
+        return cls(mask, signal, domain, is_active, center_pos)
+
 
     def __call__(self, p: Field, u: Field, rho: Field):
         """
@@ -638,68 +642,101 @@ class TransducerArray:
             A list of DistributedTransducer instances representing each element.
         """
         elements = []
-        delays = self._calculate_beamforming_delays()
+        center_offset = (self.num_elements - 1) * (self.element_width + self.element_spacing) / 2
+
+        element_dimensions = (self.element_width, self.element_height, self.element_depth)[:self.domain.ndim]
 
         for element_index in range(self.num_elements):
             # Calculate the position of the current element based on the domain dimensions
             element_pos = list(self.position)
-            element_pos[0] += (self.element_width + self.element_spacing) * element_index
+            element_pos[0] += (self.element_width + self.element_spacing) * element_index - center_offset
 
             # Create a mask for the current element
             mask = jnp.zeros(self.domain.N)
 
             # Set the mask values to 1.0 for the current element based on the domain dimensions
-            if self.domain.ndim == 1:
-                mask = mask.at[slice(element_pos[0], element_pos[0] + self.element_width)].set(1.0)
-            elif self.domain.ndim == 2:
-                mask = mask.at[
-                    slice(element_pos[0], element_pos[0] + self.element_width),
-                    slice(element_pos[1], element_pos[1] + self.element_height)
-                ].set(1.0)
-            elif self.domain.ndim == 3:
-                mask = mask.at[
-                    slice(element_pos[0], element_pos[0] + self.element_width),
-                    slice(element_pos[1], element_pos[1] + self.element_height),
-                    slice(element_pos[2], element_pos[2] + self.element_depth)
-                ].set(1.0)
+            slices = tuple(
+                slice(int(element_pos[i] / self.domain.dx[i]), int((element_pos[i] + element_dimensions[i]) / self.domain.dx[i]))
+                for i in range(self.domain.ndim)
+            )
+            mask = mask.at[slices].set(1.0)
+
+            center_pos = tuple((element_pos[i] + element_dimensions[i]) / 2 for i in range(self.domain.ndim))
+
+            delay = TransducerArray.calculate_beamforming_delays(
+                source_positions=jnp.array([center_pos]),
+                target_point=self.target_point,
+                sound_speed=self.sound_speed,
+                dx=self.domain.dx[0], 
+                dy=self.domain.dx[1]            
+            )[0]       
 
             # Add an extra dimension to the mask and convert it to a FourierSeries
             mask = jnp.expand_dims(mask, -1)
             mask = FourierSeries(mask, self.domain)
 
             # Apply beamforming delay to the signal
-            delay = delays[element_index]
             delay_samples = int(delay / self.dt)
             delayed_signal = jnp.roll(signal, delay_samples) if signal is not None else None
 
-            # Create a DistributedTransducer instance for the current element
-            element = DistributedTransducer(mask, delayed_signal, self.domain)
+            element = DistributedTransducer(mask, delayed_signal, self.domain, True, center_pos)            
             elements.append(element)
 
         return elements
 
-    def _calculate_beamforming_delays(self):
+    @staticmethod
+    def calculate_beamforming_delays(
+        source_positions: np.ndarray, 
+        target_point: np.ndarray, 
+        sound_speed: float, 
+        dx: float, 
+        dy: float
+    ) -> np.ndarray:
         """
-        Calculate the beamforming delays in seconds for each element based on the focus distance and steering angle.
-        """
-        element_pitch = (self.element_width + self.element_spacing) * self.domain.dx[0]  # element pitch in meters (dx in the x dimension)
-        element_positions = jnp.arange(self.num_elements) - (self.num_elements - 1) / 2
-        element_positions = element_positions * element_pitch  # element positions in meters
+        Calculate the beamforming delays for the signal sources based on the target point.
 
-        if jnp.isinf(self.focus_distance):
-            delays = element_positions * jnp.sin(jnp.deg2rad(self.steering_angle)) / self.sound_speed  # delays in seconds
-        else:
-            delays = (
-                self.focus_distance
-                - jnp.sqrt(
-                    self.focus_distance ** 2
-                    + element_positions ** 2
-                    - 2 * self.focus_distance * element_positions * jnp.sin(jnp.deg2rad(self.steering_angle))
-                )
-            ) / self.sound_speed  # delays in seconds
+        Parameters:
+        - source_positions: Array of signal source coordinates with shape (num_sources, 2). In meters.
+        - target_point: Array representing the target point coordinates with shape (2,). In meters.
+        - sound_speed: Speed of sound in the medium.
+        - dx: Grid spacing in the x-direction.
+        - dy: Grid spacing in the y-direction.
+
+        Returns:
+        - delays: Array of beamforming delays for each signal source with shape (num_sources,) in seconds.
+        """
+        # Calculate distances from signal sources to the target point
+        distances = jnp.sqrt(((source_positions[:, 0] - target_point[0]))**2 +
+                            ((source_positions[:, 1] - target_point[1]))**2)
+
+        # Calculate sound wave travel times
+        times = distances / sound_speed
+
+        # Normalize the times by subtracting the minimum time
+        delays = times - np.min(times)
 
         return delays
 
+    @property
+    def target_point(self) -> jnp.ndarray:
+        """
+        Calculate the target point position based on the transducer center, steering angle, and distance from the center.
+
+        Returns:
+            jnp.ndarray: The target point position as a numpy array [target_x, target_y]. In meters.
+        """
+        # Convert the steering angle from degrees to radians
+        steering_angle_rad = jnp.deg2rad(self.steering_angle)
+
+        # Calculate the target point position
+        # TODO: Handle 3D case
+        target_point = jnp.array([
+            self.position[0] - jnp.sin(steering_angle_rad) * self.focus_distance, 
+            self.position[1] + jnp.cos(steering_angle_rad) * self.focus_distance
+        ])
+
+        return target_point
+    
     def scan_line(self, sensor_data):
         """
         Apply beamforming to the sensor data to form a single scan line.
@@ -711,9 +748,17 @@ class TransducerArray:
             A 1D array representing the formed scan line.
         """
         time_samples, num_elements = sensor_data.shape
+        
+        delays_in_s = self.calculate_beamforming_delays(
+            source_positions=np.array([element.center_pos for element in transducer_array.elements]),
+            target_point=self.target_point, 
+            sound_speed=self.sound_speed, 
+            dx=self.domain.dx[0], 
+            dy=self.domain.dx[1]            
+        )
 
         # Calculate the beamforming delays in samples
-        delays_samples = jnp.round(self._calculate_beamforming_delays() / self.dt).astype(int)
+        delays_samples = jnp.round(delays_in_s / self.dt).astype(int)
 
         # Create an array to store the beamformed data
         beamformed_data = jnp.zeros(time_samples)
@@ -735,6 +780,39 @@ class TransducerArray:
 
         return beamformed_data
 
+    def scan_line_vectorized(self, sensor_data, return_debug=False):
+        """
+        Apply beamforming to the sensor data to form a single scan line using vectorized operations.
+        Optionally return debugging information.
+
+        Args:
+            sensor_data: A 2D array of shape (time_samples, num_elements) containing the sensor data.
+            return_debug: Boolean to indicate if debug information should be returned.
+
+        Returns:
+            A 1D array representing the formed scan line, optionally returns debugging info.
+        """
+        time_samples, num_elements = sensor_data.shape
+
+        # Calculate the beamforming delays in samples
+        delays_samples = jnp.round(self._calculate_beamforming_delays() / self.dt).astype(int)
+
+        # Construct an array of indices to gather data after applying delays
+        row_indices = jnp.arange(time_samples)[:, None] - delays_samples[None, :]
+        # Clip the indices so they are within valid range
+        row_indices = jnp.clip(row_indices, 0, time_samples - 1)
+
+        # Gather the data using the constructed indices, each column corresponds to delayed data for each sensor
+        delayed_data = sensor_data[row_indices, jnp.arange(num_elements)]
+
+        # Sum across the columns to perform the beamforming
+        beamformed_data = jnp.sum(delayed_data, axis=1)
+
+        if return_debug:
+            return beamformed_data, row_indices
+        return beamformed_data
+
+    
 
     def set_active_elements(self, active_elements: Union[List[Union[bool, int]], np.ndarray]) -> None:
         """

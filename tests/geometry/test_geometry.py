@@ -162,6 +162,51 @@ def test_init_invalid_radius():
             dt=1e-6,
         )
 
+        
+def test_scan_line_methods(transducer_array):
+    time_samples = 1000
+    num_elements = transducer_array.num_elements
+    sensor_data = jnp.ones((time_samples, num_elements))
+
+    # Calculate delays
+    delays_samples_original = jnp.round(transducer_array._calculate_beamforming_delays() / transducer_array.dt).astype(int)
+
+    # Run original method
+    original_result = transducer_array.scan_line(sensor_data)
+
+    # Run vectorized method with debug
+    vectorized_result, row_indices_vectorized = transducer_array.scan_line_vectorized(sensor_data, return_debug=True)
+
+    # Print intermediate values
+    print("Delays (Original):", delays_samples_original)
+    print("Row indices (Vectorized):", row_indices_vectorized)
+
+    # Final comparison
+    assert jnp.allclose(original_result, vectorized_result), "Outputs should be identical"
+
+
+def test_scan_line_output_shape(transducer_array, method):
+    """
+    Verifies that the scan_line method of the TransducerArray class processes input sensor data and outputs
+    a scan line of the expected shape. The test ensures that the method integrates sensor data across
+    transducer elements to form a single dimensional output representing time samples.
+    """
+    time_samples = 1000
+    num_elements = transducer_array.num_elements
+
+    sensor_data = jnp.ones((time_samples, num_elements))
+
+    # Depending on the method provided ('original' or 'vectorized'), invoke the appropriate function
+    if method == 'original':
+        result = transducer_array.scan_line(sensor_data)
+    elif method == 'vectorized':
+        result = transducer_array.scan_line_vectorized(sensor_data)
+    else:
+        raise ValueError("Unknown method type. Use 'original' or 'vectorized'.")
+
+    # Assert that the output shape is correct, matching the number of time samples
+    assert result.shape == (time_samples,), "The output shape of the scan line must match the number of time samples"
+    
 if __name__ == "__main__":
     testpoints_on_circle()
     testunit_fibonacci_sphere()
