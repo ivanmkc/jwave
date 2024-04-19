@@ -454,7 +454,7 @@ class Sources:
 
 @register_pytree_node_class
 class DistributedTransducer:
-    def __init__(self, mask, signal=jnp.array([]), domain=None, is_active=True, center_pos=None):
+    def __init__(self, mask, center_pos, signal=jnp.array([]), domain=None, is_active=True):
         """
         Initialize the DistributedTransducer.
 
@@ -466,17 +466,17 @@ class DistributedTransducer:
             center_pos: The center position of the transducer element (default: None).
         """
         self.mask = mask
+        self.center_pos = center_pos        
         self.signal = signal
         self.domain = domain if domain is not None else mask.domain
         self.is_active = is_active
-        self.center_pos = center_pos
 
     def tree_flatten(self):
         """
         Flatten the DistributedTransducer for PyTree compatibility.
         """
-        children = (self.mask, self.signal)
-        aux = (self.domain, self.is_active, self.center_pos)
+        children = (self.mask, self.center_pos)
+        aux = (self.signal, self.domain, self.is_active)
         return (children, aux)
 
     @classmethod
@@ -484,9 +484,9 @@ class DistributedTransducer:
         """
         Unflatten the DistributedTransducer for PyTree compatibility.
         """
-        mask, signal = children
-        domain, is_active, center_pos = aux
-        return cls(mask, signal, domain, is_active, center_pos)
+        mask, center_pos = children
+        signal, domain, is_active = aux
+        return cls(mask, center_pos, signal, domain, is_active)
 
 
     def __call__(self, p: Field, u: Field, rho: Field):
@@ -501,6 +501,10 @@ class DistributedTransducer:
         Returns:
             The output of the transducer element.
         """
+        
+        if not self.is_active:
+            return 0
+        
         return dot_product(self.mask, p)
 
     
@@ -514,7 +518,7 @@ class DistributedTransducer:
         Returns:
             A new instance of DistributedTransducer with the updated is_active state.
         """
-        return DistributedTransducer(self.mask, self.signal, self.domain, is_active)
+        return DistributedTransducer(self.mask, self.center_pos, self.signal, self.domain, is_active)
 
     def set_signal(self, signal):
         """
@@ -526,7 +530,7 @@ class DistributedTransducer:
         Returns:
             A new instance of DistributedTransducer with the updated signal.
         """
-        return DistributedTransducer(self.mask, signal, self.domain, self.is_active)
+        return DistributedTransducer(self.mask, self.center_pos, signal, self.domain, self.is_active)
 
     def on_grid(self, n):
         """
@@ -646,11 +650,28 @@ class TransducerArray:
 
         element_dimensions = (self.element_width, self.element_height, self.element_depth)[:self.domain.ndim]
 
+        center_pos_list = []
+        element_pos_list = []
         for element_index in range(self.num_elements):
             # Calculate the position of the current element based on the domain dimensions
             element_pos = list(self.position)
             element_pos[0] += (self.element_width + self.element_spacing) * element_index - center_offset
+            element_pos_list.append(element_pos)
+            
+            center_pos = tuple((element_pos[i] + element_dimensions[i]) / 2 for i in range(self.domain.ndim))
+            center_pos_list.append(center_pos)
 
+        delays_in_s = TransducerArray.calculate_beamforming_delays(
+            source_positions=jnp.array(center_pos_list),
+            target_point=self.target_point,
+            sound_speed=self.sound_speed,
+            dx=self.domain.dx[0], 
+            dy=self.domain.dx[1]            
+        )
+        
+        for element_index in range(self.num_elements):
+            element_pos = element_pos_list[element_index]
+            
             # Create a mask for the current element
             mask = jnp.zeros(self.domain.N)
 
@@ -661,25 +682,21 @@ class TransducerArray:
             )
             mask = mask.at[slices].set(1.0)
 
-            center_pos = tuple((element_pos[i] + element_dimensions[i]) / 2 for i in range(self.domain.ndim))
-
-            delay = TransducerArray.calculate_beamforming_delays(
-                source_positions=jnp.array([center_pos]),
-                target_point=self.target_point,
-                sound_speed=self.sound_speed,
-                dx=self.domain.dx[0], 
-                dy=self.domain.dx[1]            
-            )[0]       
+            center_pos = center_pos_list[element_index]
+            delay_in_s = delays_in_s[element_index]
 
             # Add an extra dimension to the mask and convert it to a FourierSeries
             mask = jnp.expand_dims(mask, -1)
             mask = FourierSeries(mask, self.domain)
-
+                
+            # print(f"delay_in_s: {delay_in_s}")
+            
             # Apply beamforming delay to the signal
-            delay_samples = int(delay / self.dt)
+            delay_samples = int(delay_in_s / self.dt)
+            # print(f"delay_samples: {delay_samples}")
             delayed_signal = jnp.roll(signal, delay_samples) if signal is not None else None
 
-            element = DistributedTransducer(mask, delayed_signal, self.domain, True, center_pos)            
+            element = DistributedTransducer(mask, center_pos, delayed_signal, self.domain, True)            
             elements.append(element)
 
         return elements
@@ -737,7 +754,7 @@ class TransducerArray:
 
         return target_point
     
-    def scan_line(self, sensor_data):
+    def scan_line(self, sensor_data: jnp.ndarray) -> jnp.ndarray:
         """
         Apply beamforming to the sensor data to form a single scan line.
 
@@ -748,35 +765,42 @@ class TransducerArray:
             A 1D array representing the formed scan line.
         """
         time_samples, num_elements = sensor_data.shape
-        
-        delays_in_s = self.calculate_beamforming_delays(
-            source_positions=np.array([element.center_pos for element in transducer_array.elements]),
-            target_point=self.target_point, 
-            sound_speed=self.sound_speed, 
-            dx=self.domain.dx[0], 
-            dy=self.domain.dx[1]            
+
+        delays_in_s = TransducerArray.calculate_beamforming_delays(
+            source_positions=np.array([element.center_pos for element in self.elements if element.is_active]),
+            target_point=self.target_point,
+            sound_speed=self.sound_speed,
+            dx=self.domain.dx[0],
+            dy=self.domain.dx[1]
         )
 
+        assert all(delay >= 0 for delay in delays_in_s), "All delays must be non-negative"
+        assert len(delays_in_s) == num_elements, "Number of delays must match the number of elements"
+
         # Calculate the beamforming delays in samples
-        delays_samples = jnp.round(delays_in_s / self.dt).astype(int)
+        delay_in_samples = jnp.round(delays_in_s / self.dt).astype(int)
 
-        # Create an array to store the beamformed data
-        beamformed_data = jnp.zeros(time_samples)
+        # Find the maximum delay
+        max_delay = jnp.max(delay_in_samples)
 
-        # Apply beamforming delays to each element
+        # Subtract the delays from the maximum delay to get the relative delays
+        relative_delays = max_delay - delay_in_samples
+
+        # Determine the required size for the padded_data
+        padded_shape = (time_samples + max_delay, num_elements)
+
+        # Create the padded_data matrix with the required size
+        padded_data = jnp.zeros(padded_shape, dtype=sensor_data.dtype)
+
+        # Copy the sensor_data into the padded_data matrix based on the relative delays
         for i in range(num_elements):
-            delay_samples = delays_samples[i]
-            if delay_samples > 0:
-                # Ensure the delay does not exceed the array bounds
-                valid_delay = min(delay_samples, time_samples)
-                beamformed_data += jnp.pad(sensor_data[:time_samples-valid_delay, i], (valid_delay, 0), 'constant')
-            elif delay_samples < 0:
-                # Correct handling for negative delays
-                valid_delay = min(-delay_samples, time_samples)
-                beamformed_data += jnp.pad(sensor_data[valid_delay:, i], (0, valid_delay), 'constant')
-            else:
-                # No delay
-                beamformed_data += sensor_data[:, i]
+            padded_data = padded_data.at[relative_delays[i]:relative_delays[i]+time_samples, i].set(sensor_data[:, i])
+
+        # Apply beamforming delays to each element by slicing the padded_data
+        shifted_data = padded_data[:time_samples + max_delay, :]
+
+        # Sum the shifted data along the element axis to get the beamformed data
+        beamformed_data = jnp.sum(shifted_data, axis=1)
 
         return beamformed_data
 
@@ -845,8 +869,9 @@ class TransducerArray:
         """
         element_outputs = []
         for element in self.elements:
-            element_output = element(p, u, rho)
-            element_outputs.append(element_output)
+            if element.is_active:
+                element_output = element(p, u, rho)
+                element_outputs.append(element_output)
         return jnp.array(element_outputs)
 
     def set_signal(self, signal):
