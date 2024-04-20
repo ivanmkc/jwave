@@ -551,6 +551,11 @@ class DistributedTransducer:
                 
         return signal * self.mask.on_grid
 
+from typing import List, Optional, Tuple, Union
+import numpy as np
+import jax.numpy as jnp
+from jax.tree_util import register_pytree_node_class
+
 @register_pytree_node_class
 class TransducerArray:
     def __init__(
@@ -568,6 +573,7 @@ class TransducerArray:
         steering_angle: float = 0.0,
         signal: jnp.ndarray = None,
         dt: float = None,
+        active_elements: Union[List[Union[bool, int]], np.ndarray] = None,
     ):
         """
         Initialize the TransducerArray.
@@ -586,6 +592,8 @@ class TransducerArray:
             steering_angle: The steering angle in degrees for beamforming (default: 0.0).
             signal: The signal to be set for all elements (default: None).
             dt: The time step of the simulation in seconds (default: None).
+            active_elements: A boolean or integer array or list indicating the active/inactive status of each element.
+                             True or 1 for active, False or 0 for inactive (default: None, all elements active).
         """
         self.domain = domain
         self.num_elements = num_elements
@@ -609,9 +617,11 @@ class TransducerArray:
         self.focus_distance = focus_distance
         self.steering_angle = steering_angle
         self.dt = dt
+        self.signal = signal
 
-        self.elements = self._create_elements(signal)
-    
+        self.active_elements = active_elements if active_elements is not None else [True] * self.num_elements
+        self.elements = self._create_elements()
+
     def tree_flatten(self):
         """
         Flatten the TransducerArray for PyTree compatibility.
@@ -619,7 +629,8 @@ class TransducerArray:
         children = (self.elements,)
         aux = (self.domain, self.num_elements, self.element_width, self.element_height,
                self.element_depth, self.element_spacing, self.position,
-               self.radius, self.sound_speed, self.focus_distance, self.steering_angle, self.dt)
+               self.radius, self.sound_speed, self.focus_distance, self.steering_angle,
+               self.dt, self.signal, self.active_elements)
         return (children, aux)
 
     @classmethod
@@ -628,32 +639,29 @@ class TransducerArray:
         Unflatten the TransducerArray for PyTree compatibility.
         """
         elements = children[0]
-        domain, num_elements, element_width, element_height, element_depth, element_spacing, position, radius, sound_speed, focus_distance, steering_angle, dt = aux
+        domain, num_elements, element_width, element_height, element_depth, element_spacing, position, radius, sound_speed, focus_distance, steering_angle, dt, signal, active_elements = aux
         transducer_array = cls(domain, num_elements, element_width, element_height, element_depth,
                                element_spacing, position, radius, sound_speed, focus_distance,
-                               steering_angle, None, dt)
+                               steering_angle, signal, dt, active_elements)
         transducer_array.elements = elements
         return transducer_array
-    
+
     @property
-    def element_pos_list(self) -> List[Tuple]:
+    def element_positions(self) -> List[Tuple]:
         center_offset = (self.num_elements - 1) * (self.element_width + self.element_spacing) / 2
-        
-        element_pos_list = []
+
+        element_positions = []
         for element_index in range(self.num_elements):
             # Calculate the position of the current element based on the domain dimensions
             element_pos = list(self.position)
             element_pos[0] += (self.element_width + self.element_spacing) * element_index - center_offset
-            element_pos_list.append(element_pos)
-            
-        return element_pos_list
+            element_positions.append(element_pos)
 
-    def _create_elements(self, signal=None) -> List[DistributedTransducer]:
+        return element_positions
+
+    def _create_elements(self) -> List[DistributedTransducer]:
         """
         Create instances of DistributedTransducer for each element and apply beamforming delays.
-
-        Args:
-            signal: The signal to be set for all elements (default: None).
 
         Returns:
             A list of DistributedTransducer instances representing each element.
@@ -663,22 +671,22 @@ class TransducerArray:
         element_dimensions = (self.element_width, self.element_height, self.element_depth)[:self.domain.ndim]
 
         delays_in_s = TransducerArray.calculate_beamforming_delays(
-            source_positions=jnp.array(self.element_pos_list),
+            source_positions=jnp.array(self.element_positions),
             target_point=self.target_point,
             sound_speed=self.sound_speed,
             max_delay=self.max_delay
         )
-        
+
         for element_index in range(self.num_elements):
-            element_pos = self.element_pos_list[element_index]
-            
+            element_pos = self.element_positions[element_index]
+
             # Create a mask for the current element
             mask = jnp.zeros(self.domain.N)
 
             # Set the mask values to 1.0 for the current element based on the domain dimensions
             slices = tuple(
-                slice(int((element_pos[i] - element_dimensions[i] / 2) / self.domain.dx[i]),
-                      int((element_pos[i] + element_dimensions[i] / 2) / self.domain.dx[i]))
+                slice(jnp.round((element_pos[i] - element_dimensions[i] / 2) / self.domain.dx[i]).astype(int),
+                      jnp.round((element_pos[i] + element_dimensions[i] / 2) / self.domain.dx[i]).astype(int))
                 for i in range(self.domain.ndim)
             )
             mask = mask.at[slices].set(1.0)
@@ -688,15 +696,12 @@ class TransducerArray:
             # Add an extra dimension to the mask and convert it to a FourierSeries
             mask = jnp.expand_dims(mask, -1)
             mask = FourierSeries(mask, self.domain)
-                
-            # print(f"delay_in_s: {delay_in_s}")
-            
-            # Apply beamforming delay to the signal
-            delay_samples = int(delay_in_s / self.dt)
-            # print(f"delay_samples: {delay_samples}")
-            delayed_signal = jnp.roll(signal, delay_samples) if signal is not None else None
 
-            element = DistributedTransducer(mask, element_pos, delayed_signal, self.domain, True)            
+            # Apply beamforming delay to the signal
+            delay_samples = jnp.round(delay_in_s / self.dt).astype(int)
+            delayed_signal = jnp.roll(self.signal, delay_samples) if self.signal is not None else None
+
+            element = DistributedTransducer(mask, element_pos, delayed_signal, self.domain, self.active_elements[element_index])
             elements.append(element)
 
         return elements
@@ -710,7 +715,7 @@ class TransducerArray:
         - delays: Array of beamforming delays for each signal source with shape (num_sources,) in seconds.
         """
         return jnp.round(self.max_delay / self.dt).astype(int)
-    
+
     @property
     def max_delay(self) -> float:
         """
@@ -719,8 +724,8 @@ class TransducerArray:
         Returns:
         - delays: Array of beamforming delays for each signal source with shape (num_sources,) in samples.
         """
-        source_positions = jnp.array(self.element_pos_list)
-        
+        source_positions = jnp.array(self.element_positions)
+
         # Calculate distances from signal sources to the target point
         distances = jnp.sqrt(((source_positions[:, 0] - self.target_point[0]))**2 +
                              ((source_positions[:, 1] - self.target_point[1]))**2)
@@ -728,8 +733,8 @@ class TransducerArray:
         # Calculate sound wave travel times
         times = distances / self.sound_speed
 
-        return float(jnp.max(times, axis=None))    
-    
+        return (jnp.max(times, axis=None)).astype(float)
+
     @staticmethod
     def calculate_beamforming_delays(
         source_positions: np.ndarray,
@@ -766,24 +771,54 @@ class TransducerArray:
         Calculate the target point position based on the transducer center, steering angle, and distance from the center.
 
         Returns:
-            jnp.ndarray: The target point position as a numpy array [target_x, target_y]. In meters.
+            jnp.ndarray: The target point position as a JAX array [target_x, target_y]. In meters.
         """
         # Convert the steering angle from degrees to radians
         steering_angle_rad = jnp.deg2rad(-self.steering_angle)
-
-        # Calculate the target point position
-        # TODO: Handle 1D and 3D case
         
-        if self.domain.ndim is not 2:
-            raise NotImplemented("Only 2D is supported at the moment")
-            
-        target_point = jnp.array([
-            self.position[0] - jnp.sin(steering_angle_rad) * self.focus_distance, 
-            self.position[1] + jnp.cos(steering_angle_rad) * self.focus_distance
-        ])
+        # Calculate the target point position
+        if self.domain.ndim == 2:
+            target_point = jnp.array(self.position) + jnp.array([
+                jnp.sin(steering_angle_rad) * self.focus_distance,
+                jnp.cos(steering_angle_rad) * self.focus_distance
+            ])
+        else:
+            raise NotImplementedError("Only 2D is supported at the moment")
 
         return target_point
-    
+
+    def set_target_point(self, point: jnp.array) -> None:
+        """
+        Set the target point position based on the given point coordinates.
+
+        This method calculates the steering angle and focus distance required to achieve the specified target point.
+
+        Args:
+            point (jnp.array): The target point coordinates as a JAX array [x, y]. In meters.
+
+        Returns:
+            None
+        """
+        # Check if the point has the correct dimensionality
+        assert point.shape == (self.domain.ndim,), f"The target point must have {self.domain.ndim} dimensions."
+
+        # Convert the position from grid points to meters
+        # position_meters = jnp.array(self.position) * jnp.array(self.domain.dx)
+
+        # Calculate the relative position of the target point with respect to the transducer center
+        relative_position = point - self.position
+
+        # Calculate the focus distance using the Euclidean norm
+        self.focus_distance = jnp.linalg.norm(relative_position)
+
+        # Calculate the steering angle using the arctangent
+        if self.domain.ndim == 2:
+            self.steering_angle = -jnp.rad2deg(jnp.arctan2(relative_position[0], relative_position[1]))
+        else:
+            raise NotImplementedError("Only 2D is supported at the moment")
+
+        self.elements = self._create_elements()
+        
     def scan_line(self, sensor_data: jnp.ndarray) -> jnp.ndarray:
         """
         Apply beamforming to the sensor data to form a single scan line.
@@ -832,7 +867,6 @@ class TransducerArray:
         beamformed_data = jnp.sum(shifted_data, axis=1)
 
         return beamformed_data
-    
 
     def set_active_elements(self, active_elements: Union[List[Union[bool, int]], np.ndarray]) -> None:
         """
@@ -844,12 +878,8 @@ class TransducerArray:
         """
         assert len(active_elements) == self.num_elements, "The length of active_elements must match the total number of elements."
 
-        for i, active in enumerate(active_elements):
-            if isinstance(active, int):
-                assert active in [0, 1], "Integer values for active_elements must be either 0 or 1."
-                self.elements[i] = self.elements[i].set_is_active(bool(active))
-            else:
-                self.elements[i] = self.elements[i].set_is_active(active)
+        self.active_elements = [bool(active) for active in active_elements]
+        self.elements = self._create_elements()
 
     def __call__(self, p: Field, u: Field, rho: Field):
         """
@@ -877,8 +907,8 @@ class TransducerArray:
         Args:
             signal: The signal to be set for all elements.
         """
-        for idx, element in enumerate(self.elements):
-            self.elements[idx] = element.set_signal(signal)
+        self.signal = signal
+        self.elements = self._create_elements()
 
     def on_grid(self, n):
         """
@@ -893,10 +923,10 @@ class TransducerArray:
         wavefield = jnp.expand_dims(jnp.zeros(self.domain.N), -1)
         
         for element in self.elements:
-            wavefield += element.on_grid(n)
-        
-        return wavefield     
-    
+                wavefield += element.on_grid(n)
+
+        return wavefield
+
     def get_segmentation_mask(self) -> np.array:
         """
         Generates a segmentation mask of the transducer elements on the grid.
@@ -913,7 +943,7 @@ class TransducerArray:
             indices = jnp.where(mask == 1)[:-1]
             segmentation_mask[indices] = idx + 1
 
-        return segmentation_mask
+        return segmentation_mask        
 
 @dataclass
 class TimeHarmonicSource:
