@@ -634,6 +634,19 @@ class TransducerArray:
                                steering_angle, None, dt)
         transducer_array.elements = elements
         return transducer_array
+    
+    @property
+    def element_pos_list(self) -> List[Tuple]:
+        center_offset = (self.num_elements - 1) * (self.element_width + self.element_spacing) / 2
+        
+        element_pos_list = []
+        for element_index in range(self.num_elements):
+            # Calculate the position of the current element based on the domain dimensions
+            element_pos = list(self.position)
+            element_pos[0] += (self.element_width + self.element_spacing) * element_index - center_offset
+            element_pos_list.append(element_pos)
+            
+        return element_pos_list
 
     def _create_elements(self, signal=None) -> List[DistributedTransducer]:
         """
@@ -646,43 +659,30 @@ class TransducerArray:
             A list of DistributedTransducer instances representing each element.
         """
         elements = []
-        center_offset = (self.num_elements - 1) * (self.element_width + self.element_spacing) / 2
 
         element_dimensions = (self.element_width, self.element_height, self.element_depth)[:self.domain.ndim]
 
-        center_pos_list = []
-        element_pos_list = []
-        for element_index in range(self.num_elements):
-            # Calculate the position of the current element based on the domain dimensions
-            element_pos = list(self.position)
-            element_pos[0] += (self.element_width + self.element_spacing) * element_index - center_offset
-            element_pos_list.append(element_pos)
-            
-            center_pos = tuple((element_pos[i] + element_dimensions[i]) / 2 for i in range(self.domain.ndim))
-            center_pos_list.append(center_pos)
-
         delays_in_s = TransducerArray.calculate_beamforming_delays(
-            source_positions=jnp.array(center_pos_list),
+            source_positions=jnp.array(self.element_pos_list),
             target_point=self.target_point,
             sound_speed=self.sound_speed,
-            dx=self.domain.dx[0], 
-            dy=self.domain.dx[1]            
+            max_delay=self.max_delay
         )
         
         for element_index in range(self.num_elements):
-            element_pos = element_pos_list[element_index]
+            element_pos = self.element_pos_list[element_index]
             
             # Create a mask for the current element
             mask = jnp.zeros(self.domain.N)
 
             # Set the mask values to 1.0 for the current element based on the domain dimensions
             slices = tuple(
-                slice(int(element_pos[i] / self.domain.dx[i]), int((element_pos[i] + element_dimensions[i]) / self.domain.dx[i]))
+                slice(int((element_pos[i] - element_dimensions[i] / 2) / self.domain.dx[i]),
+                      int((element_pos[i] + element_dimensions[i] / 2) / self.domain.dx[i]))
                 for i in range(self.domain.ndim)
             )
             mask = mask.at[slices].set(1.0)
 
-            center_pos = center_pos_list[element_index]
             delay_in_s = delays_in_s[element_index]
 
             # Add an extra dimension to the mask and convert it to a FourierSeries
@@ -696,18 +696,46 @@ class TransducerArray:
             # print(f"delay_samples: {delay_samples}")
             delayed_signal = jnp.roll(signal, delay_samples) if signal is not None else None
 
-            element = DistributedTransducer(mask, center_pos, delayed_signal, self.domain, True)            
+            element = DistributedTransducer(mask, element_pos, delayed_signal, self.domain, True)            
             elements.append(element)
 
         return elements
 
+    @property
+    def max_delay_in_samples(self) -> float:
+        """
+        Calculate the beamforming delays for the signal sources based on the target point.
+
+        Returns:
+        - delays: Array of beamforming delays for each signal source with shape (num_sources,) in seconds.
+        """
+        return jnp.round(self.max_delay / self.dt).astype(int)
+    
+    @property
+    def max_delay(self) -> float:
+        """
+        Calculate the beamforming delays for the signal sources based on the target point.
+
+        Returns:
+        - delays: Array of beamforming delays for each signal source with shape (num_sources,) in samples.
+        """
+        source_positions = jnp.array(self.element_pos_list)
+        
+        # Calculate distances from signal sources to the target point
+        distances = jnp.sqrt(((source_positions[:, 0] - self.target_point[0]))**2 +
+                             ((source_positions[:, 1] - self.target_point[1]))**2)
+
+        # Calculate sound wave travel times
+        times = distances / self.sound_speed
+
+        return float(jnp.max(times, axis=None))    
+    
     @staticmethod
     def calculate_beamforming_delays(
-        source_positions: np.ndarray, 
-        target_point: np.ndarray, 
-        sound_speed: float, 
-        dx: float, 
-        dy: float
+        source_positions: np.ndarray,
+        target_point: np.ndarray,
+        sound_speed: float,
+        max_delay: float
     ) -> np.ndarray:
         """
         Calculate the beamforming delays for the signal sources based on the target point.
@@ -716,21 +744,19 @@ class TransducerArray:
         - source_positions: Array of signal source coordinates with shape (num_sources, 2). In meters.
         - target_point: Array representing the target point coordinates with shape (2,). In meters.
         - sound_speed: Speed of sound in the medium.
-        - dx: Grid spacing in the x-direction.
-        - dy: Grid spacing in the y-direction.
 
         Returns:
         - delays: Array of beamforming delays for each signal source with shape (num_sources,) in seconds.
         """
         # Calculate distances from signal sources to the target point
         distances = jnp.sqrt(((source_positions[:, 0] - target_point[0]))**2 +
-                            ((source_positions[:, 1] - target_point[1]))**2)
+                             ((source_positions[:, 1] - target_point[1]))**2)
 
         # Calculate sound wave travel times
         times = distances / sound_speed
 
-        # Normalize the times by subtracting the minimum time
-        delays = times - np.min(times)
+        # Normalize the times by subtracting the maximum time
+        delays = max_delay - times
 
         return delays
 
@@ -743,10 +769,14 @@ class TransducerArray:
             jnp.ndarray: The target point position as a numpy array [target_x, target_y]. In meters.
         """
         # Convert the steering angle from degrees to radians
-        steering_angle_rad = jnp.deg2rad(self.steering_angle)
+        steering_angle_rad = jnp.deg2rad(-self.steering_angle)
 
         # Calculate the target point position
-        # TODO: Handle 3D case
+        # TODO: Handle 1D and 3D case
+        
+        if self.domain.ndim is not 2:
+            raise NotImplemented("Only 2D is supported at the moment")
+            
         target_point = jnp.array([
             self.position[0] - jnp.sin(steering_angle_rad) * self.focus_distance, 
             self.position[1] + jnp.cos(steering_angle_rad) * self.focus_distance
@@ -770,24 +800,23 @@ class TransducerArray:
             source_positions=np.array([element.center_pos for element in self.elements if element.is_active]),
             target_point=self.target_point,
             sound_speed=self.sound_speed,
-            dx=self.domain.dx[0],
-            dy=self.domain.dx[1]
+            max_delay=self.max_delay
         )
 
         assert all(delay >= 0 for delay in delays_in_s), "All delays must be non-negative"
         assert len(delays_in_s) == num_elements, "Number of delays must match the number of elements"
 
+        # Find the maximum delay
+        max_delay_in_samples = self.max_delay_in_samples
+
         # Calculate the beamforming delays in samples
         delay_in_samples = jnp.round(delays_in_s / self.dt).astype(int)
 
-        # Find the maximum delay
-        max_delay = jnp.max(delay_in_samples)
-
         # Subtract the delays from the maximum delay to get the relative delays
-        relative_delays = max_delay - delay_in_samples
+        relative_delays = max_delay_in_samples - delay_in_samples
 
         # Determine the required size for the padded_data
-        padded_shape = (time_samples + max_delay, num_elements)
+        padded_shape = (time_samples + max_delay_in_samples, num_elements)
 
         # Create the padded_data matrix with the required size
         padded_data = jnp.zeros(padded_shape, dtype=sensor_data.dtype)
@@ -797,45 +826,12 @@ class TransducerArray:
             padded_data = padded_data.at[relative_delays[i]:relative_delays[i]+time_samples, i].set(sensor_data[:, i])
 
         # Apply beamforming delays to each element by slicing the padded_data
-        shifted_data = padded_data[:time_samples + max_delay, :]
+        shifted_data = padded_data[:time_samples + max_delay_in_samples, :]
 
         # Sum the shifted data along the element axis to get the beamformed data
         beamformed_data = jnp.sum(shifted_data, axis=1)
 
         return beamformed_data
-
-    def scan_line_vectorized(self, sensor_data, return_debug=False):
-        """
-        Apply beamforming to the sensor data to form a single scan line using vectorized operations.
-        Optionally return debugging information.
-
-        Args:
-            sensor_data: A 2D array of shape (time_samples, num_elements) containing the sensor data.
-            return_debug: Boolean to indicate if debug information should be returned.
-
-        Returns:
-            A 1D array representing the formed scan line, optionally returns debugging info.
-        """
-        time_samples, num_elements = sensor_data.shape
-
-        # Calculate the beamforming delays in samples
-        delays_samples = jnp.round(self._calculate_beamforming_delays() / self.dt).astype(int)
-
-        # Construct an array of indices to gather data after applying delays
-        row_indices = jnp.arange(time_samples)[:, None] - delays_samples[None, :]
-        # Clip the indices so they are within valid range
-        row_indices = jnp.clip(row_indices, 0, time_samples - 1)
-
-        # Gather the data using the constructed indices, each column corresponds to delayed data for each sensor
-        delayed_data = sensor_data[row_indices, jnp.arange(num_elements)]
-
-        # Sum across the columns to perform the beamforming
-        beamformed_data = jnp.sum(delayed_data, axis=1)
-
-        if return_debug:
-            return beamformed_data, row_indices
-        return beamformed_data
-
     
 
     def set_active_elements(self, active_elements: Union[List[Union[bool, int]], np.ndarray]) -> None:
