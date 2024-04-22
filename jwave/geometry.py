@@ -865,10 +865,8 @@ class TransducerArray:
         self.steering_angle = -jnp.rad2deg(jnp.arctan2(relative_position[0], relative_position[1]))
 
         # Update transducer elements based on new settings
-        # a = self._create_elements()
-        
         new_elements = [None for _ in range(self.num_elements)]
-        
+
         delays_in_samples = jnp.round(
             TransducerArray.calculate_beamforming_delays(
                 source_positions=jnp.array(self.element_positions),
@@ -884,7 +882,7 @@ class TransducerArray:
             delayed_signal = TransducerArray._delay_signal(self.signal, delay_in_samples)
 
             new_elements[element_index] = self.elements[element_index].set_signal(delayed_signal)
-            
+
         self.elements = new_elements
 
         
@@ -971,15 +969,15 @@ class TransducerArray:
                 element_outputs.append(element_output)
         return jnp.array(element_outputs)
 
-    def set_signal(self, signal):
-        """
-        Set the same signal for all transducer elements.
+#     def set_signal(self, signal):
+#         """
+#         Set the same signal for all transducer elements.
 
-        Args:
-            signal: The signal to be set for all elements.
-        """
-        self.signal = signal
-        self.elements = self._create_elements()
+#         Args:
+#             signal: The signal to be set for all elements.
+#         """
+#         self.signal = signal
+#         self.elements = self._create_elements()
 
     def on_grid(self, n):
         """
