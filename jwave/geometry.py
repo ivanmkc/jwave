@@ -1013,6 +1013,9 @@ class TransducerArray:
             segmentation_mask[indices] = idx + 1
 
         return segmentation_mask
+    
+    def x_extents(self) -> Tuple[float, float]:
+        return float(self.elements[0].center_pos[0]), float(self.elements[-1].center_pos[0])
 
 @dataclass
 class TimeHarmonicSource:
