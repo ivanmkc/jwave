@@ -836,6 +836,32 @@ class TransducerArray:
 
         return target_point
 
+    def set_steering_angle(self, angle: float) -> None:
+        """
+        Set the steering angle of the transducer.
+
+        Args:
+            angle (float): The steering angle in degrees.
+
+        Returns:
+            None
+        """
+        self.steering_angle = angle
+        self._update_elements_signal()
+
+    def set_focus_distance(self, distance: float) -> None:
+        """
+        Set the focus distance of the transducer.
+
+        Args:
+            distance (float): The focus distance in meters.
+
+        Returns:
+            None
+        """
+        self.focus_distance = distance
+        self._update_elements_signal()
+
     def set_target_point(self, point: Union[Tuple[float, float], jnp.ndarray]) -> None:
         """
         Set the target point position based on the given point coordinates in 2D.
@@ -863,10 +889,10 @@ class TransducerArray:
 
         # Calculate the steering angle using the arctangent
         self.steering_angle = -jnp.rad2deg(jnp.arctan2(relative_position[0], relative_position[1]))
+        
+        self._update_elements_signal()
 
-        # Update transducer elements based on new settings
-        new_elements = [None for _ in range(self.num_elements)]
-
+    def _update_elements_signal(self):
         delays_in_samples = jnp.round(
             TransducerArray.calculate_beamforming_delays(
                 source_positions=jnp.array(self.element_positions),
@@ -874,6 +900,9 @@ class TransducerArray:
                 sound_speed=self.sound_speed,
                 max_delay=self.max_delay
             ) / self.dt)
+
+        # Update transducer elements based on new settings
+        new_elements = [None for _ in range(self.num_elements)]
 
         for element_index in range(self.num_elements):
             # Apply beamforming delay to the signal
