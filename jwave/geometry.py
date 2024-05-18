@@ -595,7 +595,7 @@ class TransducerArray:
             num_elements: The number of transducer elements.
             element_width: The width of each element in grid points, in the x direction.
             element_height: The height of each element in grid points (default: 1), in the y direction.
-            element_depth: The height of each element in grid points (default: 1), in the z direction.
+            element_depth: The depth of each element in grid points (default: 1), in the z direction.
             element_spacing: The spacing between elements in grid points (default: 0), in the x direction.
             position: The position of the corner of the transducer array in grid points (default: (1,)).
                       Can be a tuple of up to three dimensions or a JAX array.
@@ -620,6 +620,11 @@ class TransducerArray:
         assert self.position.ndim == 1, "Position must be a 1D array."
         assert self.position.size == self.domain.ndim, f"Position dimensionality {self.position.size} must match domain dimensionality {self.domain.ndim}"
 
+        # Check if the position is outside the domain size
+        for i in range(self.position.size):
+            if self.position[i] < 0 or self.position[i] >= self.domain.size[i]:
+                logger.warning(f"Position {self.position} is outside the domain size {self.domain.size}")
+        
         self.radius = radius
         if not jnp.isinf(self.radius):
             raise NotImplementedError("A finite radius is not currently supported")
@@ -666,7 +671,7 @@ class TransducerArray:
         element_positions = []
         for element_index in range(self.num_elements):
             # Calculate the position of the current element based on the domain dimensions
-            element_pos = list(self.position)
+            element_pos = self.position.tolist()
             element_pos[0] += (self.element_width + self.element_spacing) * element_index - center_offset
             element_positions.append(element_pos)
 
@@ -692,6 +697,32 @@ class TransducerArray:
 
         return delayed_signal
     
+    @staticmethod
+    def calculate_slices(
+        center_pos: Tuple[float, ...],
+        element_dimensions: Tuple[float, ...],
+        domain_dx: Tuple[float, ...]
+    ) -> Tuple[slice, ...]:
+        """
+        Calculate the slices for the element mask based on its center position and dimensions.
+
+        Args:
+            center_pos (tuple): The center position of the element in grid points.
+            element_dimensions (tuple): The dimensions of the element in grid points.
+            domain_dx (tuple): The grid spacing in each dimension.
+
+        Returns:
+            tuple: Slices for each dimension.
+        """
+        slices = tuple(
+            slice(
+                int(jnp.floor((center_pos[i] - element_dimensions[i] / 2) / domain_dx[i])),
+                int(jnp.ceil((center_pos[i] + element_dimensions[i] / 2) / domain_dx[i]))
+            )
+            for i in range(len(center_pos))
+        )
+        return slices
+
     def _create_elements(self) -> List[DistributedTransducer]:
         """
         Create instances of DistributedTransducer for each element and apply beamforming delays.
@@ -717,12 +748,14 @@ class TransducerArray:
             # Create a mask for the current element
             mask = jnp.zeros(self.domain.N)
 
-            # Set the mask values to 1.0 for the current element based on the domain dimensions
-            slices = tuple(
-                slice(jnp.round((element_pos[i] - element_dimensions[i] / 2) / self.domain.dx[i]).astype(int),
-                      jnp.round((element_pos[i] + element_dimensions[i] / 2) / self.domain.dx[i]).astype(int))
-                for i in range(self.domain.ndim)
-            )
+            # Calculate the slices for the current element
+            slices = TransducerArray.calculate_slices(element_pos, element_dimensions, self.domain.dx)
+            print(f"element_pos: {element_pos}")
+            print(f"element_dimensions: {element_dimensions}")
+            print(f"self.domain.dx: {self.domain.dx}")
+            print(f"slices: {slices}")
+
+            # Set the mask values to 1.0 for the current element based on the calculated slices
             mask = mask.at[slices].set(1.0)
 
             # Add an extra dimension to the mask and convert it to a FourierSeries
@@ -731,7 +764,6 @@ class TransducerArray:
 
             # Apply beamforming delay to the signal
             delay_in_samples = delays_in_samples[element_index]
-            # TODO: Handle case where sufficiently long signal will roll over the right edge.             
             delayed_signal = TransducerArray._delay_signal(self.signal, delay_in_samples)
 
             element = DistributedTransducer(mask, element_pos, delayed_signal, self.domain, bool(self.active_elements[element_index]))
@@ -760,8 +792,7 @@ class TransducerArray:
         source_positions = jnp.array(self.element_positions)
 
         # Calculate distances from signal sources to the target point
-        distances = jnp.sqrt(((source_positions[:, 0] - self.target_point[0]))**2 +
-                             ((source_positions[:, 1] - self.target_point[1]))**2)
+        distances = jnp.sqrt(jnp.sum((source_positions - self.target_point) ** 2, axis=-1))
 
         # Calculate sound wave travel times
         times = distances / self.sound_speed
@@ -792,19 +823,12 @@ class TransducerArray:
         """
         # Convert list inputs to jnp.ndarray if necessary
         if isinstance(source_positions, tuple):
-            x_pos, y_pos = source_positions
-            x_pos = jnp.array(x_pos)
-            y_pos = jnp.array(y_pos)
-            source_positions_array = jnp.column_stack((x_pos, y_pos))
-        else:
-            source_positions_array = source_positions
-
-        # Ensure target_point is an array
-        target_point_array = jnp.array(target_point)
-
+            source_positions = jnp.column_stack(source_positions)
+        
+        target_point = jnp.array(target_point)
+        
         # Calculate distances from signal sources to the target point
-        distances = jnp.sqrt(((source_positions_array[:, 0] - target_point_array[0])**2) +
-                             ((source_positions_array[:, 1] - target_point_array[1])**2))
+        distances = jnp.sqrt(jnp.sum((source_positions - target_point) ** 2, axis=-1))
 
         # Calculate sound wave travel times
         times = distances / sound_speed
@@ -820,7 +844,7 @@ class TransducerArray:
         Calculate the target point position based on the transducer center, steering angle, and distance from the center.
 
         Returns:
-            jnp.ndarray: The target point position as a JAX array [target_x, target_y]. In meters.
+            jnp.ndarray: The target point position as a JAX array. In meters.
         """
         # Convert the steering angle from degrees to radians
         steering_angle_rad = jnp.deg2rad(-self.steering_angle)
@@ -831,8 +855,14 @@ class TransducerArray:
                 jnp.sin(steering_angle_rad) * self.focus_distance,
                 jnp.cos(steering_angle_rad) * self.focus_distance
             ])
+        elif self.domain.ndim == 3:
+            target_point = jnp.array(self.position) + jnp.array([
+                jnp.sin(steering_angle_rad) * self.focus_distance,
+                jnp.cos(steering_angle_rad) * self.focus_distance,
+                0.0  # Assuming no steering in the z-direction for simplicity
+            ])
         else:
-            raise NotImplementedError("Only 2D is supported at the moment")
+            raise NotImplementedError("Only 2D and 3D are supported")
 
         return target_point
 
@@ -864,12 +894,12 @@ class TransducerArray:
 
     def set_target_point(self, point: Union[Tuple[float, float], jnp.ndarray]) -> None:
         """
-        Set the target point position based on the given point coordinates in 2D.
+        Set the target point position based on the given point coordinates in 2D or 3D.
 
         This method calculates the steering angle and focus distance required to achieve the specified target point.
 
         Args:
-            point (Union[Tuple[float, float], jnp.ndarray]): The target point coordinates as a tuple or JAX array [x, y]. In meters. Must be 2D.
+            point (Union[Tuple[float, float], jnp.ndarray]): The target point coordinates as a tuple or JAX array. In meters.
 
         Returns:
             None
@@ -877,9 +907,9 @@ class TransducerArray:
         # Convert point to jnp.ndarray if it's not already
         point_array = jnp.array(point)
 
-        # Ensure that the point is a 2D vector
-        if point_array.shape != (2,):
-            raise ValueError("The target point must be a 2D vector with exactly two elements.")
+        # Ensure that the point is a vector of appropriate dimensionality
+        if point_array.shape[0] != self.domain.ndim:
+            raise ValueError(f"The target point must be a vector with {self.domain.ndim} elements.")
 
         # Calculate the relative position of the target point with respect to the transducer center
         relative_position = point_array - self.position
@@ -888,7 +918,15 @@ class TransducerArray:
         self.focus_distance = jnp.linalg.norm(relative_position)
 
         # Calculate the steering angle using the arctangent
-        self.steering_angle = -jnp.rad2deg(jnp.arctan2(relative_position[0], relative_position[1]))
+        if self.domain.ndim == 2:
+            self.steering_angle = -jnp.rad2deg(jnp.arctan2(relative_position[0], relative_position[1]))
+        elif self.domain.ndim == 3:
+            # Calculate steering angles in 3D (e.g., azimuth and elevation)
+            azimuth = -jnp.rad2deg(jnp.arctan2(relative_position[0], relative_position[1]))
+            elevation = -jnp.rad2deg(jnp.arctan2(relative_position[2], jnp.sqrt(relative_position[0]**2 + relative_position[1]**2)))
+            self.steering_angle = (azimuth, elevation)
+        else:
+            raise NotImplementedError("Only 2D and 3D are supported")
         
         self._update_elements_signal()
 
@@ -997,16 +1035,6 @@ class TransducerArray:
                 element_output = element(p, u, rho)
                 element_outputs.append(element_output)
         return jnp.array(element_outputs)
-
-#     def set_signal(self, signal):
-#         """
-#         Set the same signal for all transducer elements.
-
-#         Args:
-#             signal: The signal to be set for all elements.
-#         """
-#         self.signal = signal
-#         self.elements = self._create_elements()
 
     def on_grid(self, n):
         """
