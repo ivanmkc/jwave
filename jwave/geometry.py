@@ -567,7 +567,6 @@ class DistributedTransducer:
         idx = n.astype(jnp.int32)
         signal = self.signal[:, idx]
         return signal * self.mask.on_grid
-
 @register_pytree_node_class
 class TransducerArray:
     def __init__(
@@ -582,7 +581,8 @@ class TransducerArray:
         radius: float = float("inf"),
         sound_speed: Optional[float] = None,
         focus_distance: float = float("inf"),
-        steering_angle: float = 0.0,
+        azimuth: float = 0.0,
+        elevation: float = 0.0,
         signal: Optional[jnp.ndarray] = None,
         dt: Optional[float] = None,
         active_elements: Optional[Union[List[Union[bool, int]], np.ndarray]] = None,
@@ -602,7 +602,8 @@ class TransducerArray:
             radius: The radius of curvature of the transducer array in meters (default: inf).
             sound_speed: The assumed homogeneous sound speed in meters per second for beamforming purposes (default: None).
             focus_distance: The focus distance in meters for beamforming (default: inf).
-            steering_angle: The steering angle in degrees for beamforming (default: 0.0).
+            azimuth: The azimuth angle in degrees for beamforming (default: 0.0).
+            elevation: The elevation angle in degrees for beamforming (default: 0.0).
             signal: The signal to be set for all elements (default: None).
             dt: The time step of the simulation in seconds (default: None).
             active_elements: A boolean or integer array or list indicating the active/inactive status of each element.
@@ -633,7 +634,8 @@ class TransducerArray:
         assert dt is not None, "dt must be provided"
         self.sound_speed = sound_speed
         self.focus_distance = focus_distance
-        self.steering_angle = steering_angle
+        self.azimuth = azimuth
+        self.elevation = elevation
         self.dt = dt
         self.signal = signal
         self.active_elements = jnp.array(active_elements) if active_elements is not None else jnp.ones(num_elements, dtype=bool)
@@ -647,8 +649,8 @@ class TransducerArray:
         children = (self.elements,)
         aux = (self.domain, self.num_elements, self.element_width, self.element_height,
                self.element_depth, self.element_spacing, self.position,
-               self.radius, self.sound_speed, self.focus_distance, self.steering_angle,
-               self.dt, self.signal, self.active_elements)
+               self.radius, self.sound_speed, self.focus_distance, self.azimuth,
+               self.elevation, self.dt, self.signal, self.active_elements)
         return (children, aux)
 
     @classmethod
@@ -657,10 +659,10 @@ class TransducerArray:
         Unflatten the TransducerArray for PyTree compatibility.
         """
         elements = children[0]
-        domain, num_elements, element_width, element_height, element_depth, element_spacing, position, radius, sound_speed, focus_distance, steering_angle, dt, signal, active_elements = aux
+        domain, num_elements, element_width, element_height, element_depth, element_spacing, position, radius, sound_speed, focus_distance, azimuth, elevation, dt, signal, active_elements = aux
         transducer_array = cls(domain, num_elements, element_width, element_height, element_depth,
                                element_spacing, position, radius, sound_speed, focus_distance,
-                               steering_angle, signal, dt, active_elements)
+                               azimuth, elevation, signal, dt, active_elements)
         transducer_array.elements = elements
         return transducer_array
 
@@ -750,10 +752,6 @@ class TransducerArray:
 
             # Calculate the slices for the current element
             slices = TransducerArray.calculate_slices(element_pos, element_dimensions, self.domain.dx)
-            print(f"element_pos: {element_pos}")
-            print(f"element_dimensions: {element_dimensions}")
-            print(f"self.domain.dx: {self.domain.dx}")
-            print(f"slices: {slices}")
 
             # Set the mask values to 1.0 for the current element based on the calculated slices
             mask = mask.at[slices].set(1.0)
@@ -841,42 +839,56 @@ class TransducerArray:
     @property
     def target_point(self) -> jnp.ndarray:
         """
-        Calculate the target point position based on the transducer center, steering angle, and distance from the center.
+        Calculate the target point position based on the transducer center, azimuth, elevation, and distance from the center.
 
         Returns:
             jnp.ndarray: The target point position as a JAX array. In meters.
         """
-        # Convert the steering angle from degrees to radians
-        steering_angle_rad = jnp.deg2rad(-self.steering_angle)
+        # Convert the azimuth and elevation from degrees to radians
+        azimuth_rad = jnp.deg2rad(-self.azimuth)
+        elevation_rad = jnp.deg2rad(-self.elevation)
         
         # Calculate the target point position
         if self.domain.ndim == 2:
             target_point = jnp.array(self.position) + jnp.array([
-                jnp.sin(steering_angle_rad) * self.focus_distance,
-                jnp.cos(steering_angle_rad) * self.focus_distance
+                jnp.sin(azimuth_rad) * self.focus_distance,
+                jnp.cos(azimuth_rad) * self.focus_distance
             ])
         elif self.domain.ndim == 3:
             target_point = jnp.array(self.position) + jnp.array([
-                jnp.sin(steering_angle_rad) * self.focus_distance,
-                jnp.cos(steering_angle_rad) * self.focus_distance,
-                0.0  # Assuming no steering in the z-direction for simplicity
+                jnp.sin(azimuth_rad) * jnp.cos(elevation_rad) * self.focus_distance,
+                jnp.cos(azimuth_rad) * jnp.cos(elevation_rad) * self.focus_distance,
+                jnp.sin(elevation_rad) * self.focus_distance
             ])
         else:
             raise NotImplementedError("Only 2D and 3D are supported")
 
         return target_point
 
-    def set_steering_angle(self, angle: float) -> None:
+    def set_azimuth(self, azimuth: float) -> None:
         """
-        Set the steering angle of the transducer.
+        Set the azimuth angle of the transducer.
 
         Args:
-            angle (float): The steering angle in degrees.
+            azimuth (float): The azimuth angle in degrees.
 
         Returns:
             None
         """
-        self.steering_angle = angle
+        self.azimuth = azimuth
+        self._update_elements_signal()
+
+    def set_elevation(self, elevation: float) -> None:
+        """
+        Set the elevation angle of the transducer.
+
+        Args:
+            elevation (float): The elevation angle in degrees.
+
+        Returns:
+            None
+        """
+        self.elevation = elevation
         self._update_elements_signal()
 
     def set_focus_distance(self, distance: float) -> None:
@@ -896,7 +908,7 @@ class TransducerArray:
         """
         Set the target point position based on the given point coordinates in 2D or 3D.
 
-        This method calculates the steering angle and focus distance required to achieve the specified target point.
+        This method calculates the steering angles (azimuth, elevation) and focus distance required to achieve the specified target point.
 
         Args:
             point (Union[Tuple[float, float], jnp.ndarray]): The target point coordinates as a tuple or JAX array. In meters.
@@ -917,14 +929,14 @@ class TransducerArray:
         # Calculate the focus distance using the Euclidean norm
         self.focus_distance = jnp.linalg.norm(relative_position)
 
-        # Calculate the steering angle using the arctangent
+        # Calculate the steering angles using the arctangent
         if self.domain.ndim == 2:
-            self.steering_angle = -jnp.rad2deg(jnp.arctan2(relative_position[0], relative_position[1]))
+            self.azimuth = -jnp.rad2deg(jnp.arctan2(relative_position[0], relative_position[1]))
+            self.elevation = 0.0  # No elevation in 2D
         elif self.domain.ndim == 3:
-            # Calculate steering angles in 3D (e.g., azimuth and elevation)
-            azimuth = -jnp.rad2deg(jnp.arctan2(relative_position[0], relative_position[1]))
-            elevation = -jnp.rad2deg(jnp.arctan2(relative_position[2], jnp.sqrt(relative_position[0]**2 + relative_position[1]**2)))
-            self.steering_angle = (azimuth, elevation)
+            # Calculate azimuth and elevation angles in 3D
+            self.azimuth = -jnp.rad2deg(jnp.arctan2(relative_position[0], relative_position[1]))
+            self.elevation = -jnp.rad2deg(jnp.arctan2(relative_position[2], jnp.sqrt(relative_position[0]**2 + relative_position[1]**2)))
         else:
             raise NotImplementedError("Only 2D and 3D are supported")
         
